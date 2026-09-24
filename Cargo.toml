@@ -1,0 +1,9 @@
+[package]
+name = "waytime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.45"
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "macros", "signal", "sync"] }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
