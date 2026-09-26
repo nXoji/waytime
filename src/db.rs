@@ -3,6 +3,12 @@ use rusqlite::{params, Connection, Result};
 use std::fs::create_dir_all;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone)]
+pub struct AppSummary {
+    pub app_id: String,
+    pub duration_sec: i64,
+}
+
 pub struct Database {
     conn: Connection,
 }
@@ -56,5 +62,30 @@ impl Database {
             params![ended_at, id],
         )?;
         Ok(())
+    }
+
+    pub fn get_summary_since(&self, since_ts: i64) -> Result<Vec<AppSummary>, rusqlite::Error> {
+        let now = chrono::Local::now().timestamp();
+        let mut stmt = self.conn.prepare(
+            "SELECT app_id, SUM(MAX(0, MIN(ended_at, ?2) - MAX(started_at, ?1))) AS total_duration
+             FROM activity_intervals
+             WHERE ended_at >= ?1
+             GROUP BY app_id
+             HAVING total_duration > 0
+             ORDER BY total_duration DESC",
+        )?;
+
+        let rows = stmt.query_map(params![since_ts, now], |row| {
+            Ok(AppSummary {
+                app_id: row.get(0)?,
+                duration_sec: row.get(1)?,
+            })
+        })?;
+
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
     }
 }
