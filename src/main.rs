@@ -1,8 +1,10 @@
+mod afk;
 mod cli;
 mod db;
 mod tracker;
 mod watcher;
 
+use afk::{AfkEvent, AfkWatcher};
 use chrono::Local;
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -25,6 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let db = Database::open()?;
             let mut tracker = Tracker::new(db);
             let mut watcher = WindowWatcher::new().await?;
+            let mut afk_watcher = AfkWatcher::new().await?;
 
             let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
             heartbeat_interval.tick().await;
@@ -40,6 +43,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
                         println!("[{timestamp}] App: {} | Title: {}", event.app_id, event.title);
                         tracker.handle_window_event(event);
+                    }
+                    Some(afk_event) = afk_watcher.next_event() => {
+                        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+                        match afk_event {
+                            AfkEvent::Pause => {
+                                println!("[{timestamp}] State: Paused (AFK / Screen Locked / Sleep)");
+                                tracker.pause();
+                            }
+                            AfkEvent::Resume => {
+                                println!("[{timestamp}] State: Resumed");
+                                tracker.resume();
+                            }
+                        }
                     }
                     _ = heartbeat_interval.tick() => {
                         tracker.heartbeat(Local::now().timestamp());

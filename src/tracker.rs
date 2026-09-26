@@ -14,6 +14,7 @@ struct ActiveSession {
 pub struct Tracker {
     db: Database,
     active_session: Option<ActiveSession>,
+    is_paused: bool,
 }
 
 impl Tracker {
@@ -21,10 +22,55 @@ impl Tracker {
         Self {
             db,
             active_session: None,
+            is_paused: false,
+        }
+    }
+
+    pub fn pause(&mut self) {
+        if self.is_paused {
+            return;
+        }
+
+        if let Some(session) = &mut self.active_session {
+            let now = Local::now().timestamp();
+            session.ended_at = now;
+            let duration = session.ended_at - session.started_at;
+            if duration >= 1 {
+                if let Some(id) = session.db_id {
+                    let _ = self.db.update_interval_end(id, session.ended_at);
+                } else if let Ok(id) = self.db.insert_interval(
+                    &session.app_id,
+                    &session.title,
+                    session.started_at,
+                    session.ended_at,
+                ) {
+                    session.db_id = Some(id);
+                }
+            }
+        }
+
+        self.is_paused = true;
+    }
+
+    pub fn resume(&mut self) {
+        if !self.is_paused {
+            return;
+        }
+
+        self.is_paused = false;
+        let now = Local::now().timestamp();
+        if let Some(session) = &mut self.active_session {
+            session.started_at = now;
+            session.ended_at = now;
+            session.db_id = None;
         }
     }
 
     pub fn handle_window_event(&mut self, event: WindowEvent) {
+        if self.is_paused {
+            self.is_paused = false;
+        }
+
         let now = Local::now().timestamp();
 
         if let Some(session) = &mut self.active_session {
@@ -61,6 +107,10 @@ impl Tracker {
     }
 
     pub fn heartbeat(&mut self, now: i64) {
+        if self.is_paused {
+            return;
+        }
+
         if let Some(session) = &mut self.active_session {
             session.ended_at = now;
             if session.ended_at - session.started_at >= 1 {
