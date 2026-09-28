@@ -64,18 +64,21 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_summary_since(&self, since_ts: i64) -> Result<Vec<AppSummary>, rusqlite::Error> {
-        let now = chrono::Local::now().timestamp();
+    pub fn get_summary_range(
+        &self,
+        start_ts: i64,
+        end_ts: i64,
+    ) -> Result<Vec<AppSummary>, rusqlite::Error> {
         let mut stmt = self.conn.prepare(
             "SELECT app_id, SUM(MAX(0, MIN(ended_at, ?2) - MAX(started_at, ?1))) AS total_duration
              FROM activity_intervals
-             WHERE ended_at >= ?1
+             WHERE ended_at >= ?1 AND started_at <= ?2
              GROUP BY app_id
              HAVING total_duration > 0
              ORDER BY total_duration DESC",
         )?;
 
-        let rows = stmt.query_map(params![since_ts, now], |row| {
+        let rows = stmt.query_map(params![start_ts, end_ts], |row| {
             Ok(AppSummary {
                 app_id: row.get(0)?,
                 duration_sec: row.get(1)?,
@@ -87,5 +90,10 @@ impl Database {
             summaries.push(row?);
         }
         Ok(summaries)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_summary_since(&self, since_ts: i64) -> Result<Vec<AppSummary>, rusqlite::Error> {
+        self.get_summary_range(since_ts, chrono::Local::now().timestamp())
     }
 }
