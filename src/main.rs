@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         let db = Database::open()?;
-        cli::run_report(&db, args.period())?;
+        cli::run_report(&db, args.period(), args.details)?;
     }
 
     Ok(())

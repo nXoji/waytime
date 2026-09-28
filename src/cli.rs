@@ -30,6 +30,10 @@ pub struct Cli {
     /// Show report for the last 30 days
     #[arg(short = 'm', long, conflicts_with_all = ["yesterday", "week"])]
     pub month: bool,
+
+    /// Show detailed window title breakdown
+    #[arg(short = 'd', long, global = true)]
+    pub details: bool,
 }
 
 impl Cli {
@@ -103,47 +107,118 @@ pub fn get_range_for_period(period: ReportPeriod) -> (i64, i64, &'static str) {
     }
 }
 
-pub fn run_report(db: &Database, period: ReportPeriod) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_report(
+    db: &Database,
+    period: ReportPeriod,
+    details: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (start_ts, end_ts, title_label) = get_range_for_period(period);
-    let summaries = db.get_summary_range(start_ts, end_ts)?;
 
     println!("Report: {title_label}");
-    if summaries.is_empty() {
-        println!("No activity recorded for {}.", title_label.to_lowercase());
-        return Ok(());
-    }
 
-    let total_sec: i64 = summaries.iter().map(|s| s.duration_sec).sum();
+    if details {
+        let summaries = db.get_detailed_summary_range(start_ts, end_ts)?;
+        if summaries.is_empty() {
+            println!("No activity recorded for {}.", title_label.to_lowercase());
+            return Ok(());
+        }
 
-    let mut table = Table::new();
-    table.load_style(ASCII_FULL);
-    table.set_header(vec![
-        Cell::new("Application"),
-        Cell::new("Time Spent"),
-        Cell::new("Share (%)"),
-    ]);
+        let total_sec: i64 = summaries.iter().map(|s| s.total_duration_sec).sum();
 
-    for app in &summaries {
-        let share = if total_sec > 0 {
-            (app.duration_sec as f64 / total_sec as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        table.add_row(vec![
-            Cell::new(&app.app_id),
-            Cell::new(format_duration(app.duration_sec)),
-            Cell::new(format!("{share:.1}%")),
+        let mut table = Table::new();
+        table.load_style(ASCII_FULL);
+        table.set_header(vec![
+            Cell::new("Application / Window Title"),
+            Cell::new("Time Spent"),
+            Cell::new("Share (%)"),
         ]);
-    }
 
-    println!("{table}");
-    println!("Total Screen Time: {}", format_duration(total_sec));
+        for app in &summaries {
+            let app_share = if total_sec > 0 {
+                (app.total_duration_sec as f64 / total_sec as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            table.add_row(vec![
+                Cell::new(&app.app_id),
+                Cell::new(format_duration(app.total_duration_sec)),
+                Cell::new(format!("{app_share:.1}%")),
+            ]);
+
+            let valid_titles: Vec<_> = app.titles.iter().filter(|t| t.duration_sec >= 2).collect();
+            for (i, t) in valid_titles.iter().enumerate() {
+                let clean_title = if t.title.trim().is_empty() {
+                    "[Untitled]".to_string()
+                } else if t.title.chars().count() > 60 {
+                    let truncated: String = t.title.chars().take(57).collect();
+                    format!("{truncated}...")
+                } else {
+                    t.title.clone()
+                };
+
+                let prefix = if i == valid_titles.len() - 1 {
+                    "└── "
+                } else {
+                    "├── "
+                };
+                let title_display = format!("{prefix}{clean_title}");
+
+                let title_share = if app.total_duration_sec > 0 {
+                    (t.duration_sec as f64 / app.total_duration_sec as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                table.add_row(vec![
+                    Cell::new(title_display),
+                    Cell::new(format_duration(t.duration_sec)),
+                    Cell::new(format!("({title_share:.1}% of app)")),
+                ]);
+            }
+        }
+
+        println!("{table}");
+        println!("Total Screen Time: {}", format_duration(total_sec));
+    } else {
+        let summaries = db.get_summary_range(start_ts, end_ts)?;
+        if summaries.is_empty() {
+            println!("No activity recorded for {}.", title_label.to_lowercase());
+            return Ok(());
+        }
+
+        let total_sec: i64 = summaries.iter().map(|s| s.duration_sec).sum();
+
+        let mut table = Table::new();
+        table.load_style(ASCII_FULL);
+        table.set_header(vec![
+            Cell::new("Application"),
+            Cell::new("Time Spent"),
+            Cell::new("Share (%)"),
+        ]);
+
+        for app in &summaries {
+            let share = if total_sec > 0 {
+                (app.duration_sec as f64 / total_sec as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            table.add_row(vec![
+                Cell::new(&app.app_id),
+                Cell::new(format_duration(app.duration_sec)),
+                Cell::new(format!("{share:.1}%")),
+            ]);
+        }
+
+        println!("{table}");
+        println!("Total Screen Time: {}", format_duration(total_sec));
+    }
 
     Ok(())
 }
 
 #[allow(dead_code)]
 pub fn run_today_report(db: &Database) -> Result<(), Box<dyn std::error::Error>> {
-    run_report(db, ReportPeriod::Today)
+    run_report(db, ReportPeriod::Today, false)
 }

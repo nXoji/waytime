@@ -9,6 +9,19 @@ pub struct AppSummary {
     pub duration_sec: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct TitleSummary {
+    pub title: String,
+    pub duration_sec: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppDetailedSummary {
+    pub app_id: String,
+    pub total_duration_sec: i64,
+    pub titles: Vec<TitleSummary>,
+}
+
 pub struct Database {
     conn: Connection,
 }
@@ -90,6 +103,58 @@ impl Database {
             summaries.push(row?);
         }
         Ok(summaries)
+    }
+
+    pub fn get_detailed_summary_range(
+        &self,
+        start_ts: i64,
+        end_ts: i64,
+    ) -> Result<Vec<AppDetailedSummary>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT app_id, window_title, SUM(MAX(0, MIN(ended_at, ?2) - MAX(started_at, ?1))) AS total_duration
+             FROM activity_intervals
+             WHERE ended_at >= ?1 AND started_at <= ?2
+             GROUP BY app_id, window_title
+             HAVING total_duration > 0
+             ORDER BY app_id, total_duration DESC",
+        )?;
+
+        let rows = stmt.query_map(params![start_ts, end_ts], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut apps: Vec<AppDetailedSummary> = Vec::new();
+        for row in rows {
+            let (app_id, title, duration_sec) = row?;
+            if let Some(existing) = apps.iter_mut().find(|a| a.app_id == app_id) {
+                existing.total_duration_sec += duration_sec;
+                existing.titles.push(TitleSummary {
+                    title,
+                    duration_sec,
+                });
+            } else {
+                apps.push(AppDetailedSummary {
+                    app_id,
+                    total_duration_sec: duration_sec,
+                    titles: vec![TitleSummary {
+                        title,
+                        duration_sec,
+                    }],
+                });
+            }
+        }
+
+        apps.sort_by(|a, b| b.total_duration_sec.cmp(&a.total_duration_sec));
+
+        for app in &mut apps {
+            app.titles.sort_by(|a, b| b.duration_sec.cmp(&a.duration_sec));
+        }
+
+        Ok(apps)
     }
 
     #[allow(dead_code)]
