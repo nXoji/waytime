@@ -1,7 +1,7 @@
 use chrono::{Local, NaiveTime};
 use clap::{Parser, Subcommand};
-use comfy_table::presets::ASCII_FULL;
-use comfy_table::{Cell, Table};
+use comfy_table::presets::UTF8_FULL;
+use comfy_table::{Cell, CellAlignment, Table};
 
 use crate::db::Database;
 
@@ -77,7 +77,7 @@ pub fn format_duration(seconds: i64) -> String {
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;
     let secs = seconds % 60;
-    format!("{hours}h {minutes}m {secs}s")
+    format!("{hours}h {minutes:02}m {secs:02}s")
 }
 
 pub fn local_midnight_timestamp() -> i64 {
@@ -126,12 +126,18 @@ pub fn run_report(
         let total_sec: i64 = summaries.iter().map(|s| s.total_duration_sec).sum();
 
         let mut table = Table::new();
-        table.load_style(ASCII_FULL);
+        table.load_style(UTF8_FULL);
         table.set_header(vec![
             Cell::new("Application / Window Title"),
-            Cell::new("Time Spent"),
-            Cell::new("Share (%)"),
+            Cell::new("Time Spent").set_alignment(CellAlignment::Right),
+            Cell::new("Share (%)").set_alignment(CellAlignment::Right),
         ]);
+        if let Some(col) = table.column_mut(1) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
+        if let Some(col) = table.column_mut(2) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
 
         for app in &summaries {
             let app_share = if total_sec > 0 {
@@ -142,8 +148,9 @@ pub fn run_report(
 
             table.add_row(vec![
                 Cell::new(&app.app_id),
-                Cell::new(format_duration(app.total_duration_sec)),
-                Cell::new(format!("{app_share:.1}%")),
+                Cell::new(format_duration(app.total_duration_sec))
+                    .set_alignment(CellAlignment::Right),
+                Cell::new(format!("{app_share:.1}%")).set_alignment(CellAlignment::Right),
             ]);
 
             let valid_titles: Vec<_> = app.titles.iter().filter(|t| t.duration_sec >= 2).collect();
@@ -172,8 +179,9 @@ pub fn run_report(
 
                 table.add_row(vec![
                     Cell::new(title_display),
-                    Cell::new(format_duration(t.duration_sec)),
-                    Cell::new(format!("({title_share:.1}% of app)")),
+                    Cell::new(format_duration(t.duration_sec)).set_alignment(CellAlignment::Right),
+                    Cell::new(format!("({title_share:.1}% of app)"))
+                        .set_alignment(CellAlignment::Right),
                 ]);
             }
         }
@@ -190,12 +198,18 @@ pub fn run_report(
         let total_sec: i64 = summaries.iter().map(|s| s.duration_sec).sum();
 
         let mut table = Table::new();
-        table.load_style(ASCII_FULL);
+        table.load_style(UTF8_FULL);
         table.set_header(vec![
             Cell::new("Application"),
-            Cell::new("Time Spent"),
-            Cell::new("Share (%)"),
+            Cell::new("Time Spent").set_alignment(CellAlignment::Right),
+            Cell::new("Share (%)").set_alignment(CellAlignment::Right),
         ]);
+        if let Some(col) = table.column_mut(1) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
+        if let Some(col) = table.column_mut(2) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
 
         for app in &summaries {
             let share = if total_sec > 0 {
@@ -206,8 +220,8 @@ pub fn run_report(
 
             table.add_row(vec![
                 Cell::new(&app.app_id),
-                Cell::new(format_duration(app.duration_sec)),
-                Cell::new(format!("{share:.1}%")),
+                Cell::new(format_duration(app.duration_sec)).set_alignment(CellAlignment::Right),
+                Cell::new(format!("{share:.1}%")).set_alignment(CellAlignment::Right),
             ]);
         }
 
