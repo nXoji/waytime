@@ -73,6 +73,7 @@ impl Tracker {
 
         let now = Local::now().timestamp();
 
+        #[allow(clippy::collapsible_if)]
         if let Some(session) = &mut self.active_session {
             if session.app_id == event.app_id && session.title == event.title {
                 session.ended_at = now;

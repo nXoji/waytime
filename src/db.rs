@@ -148,10 +148,10 @@ impl Database {
             }
         }
 
-        apps.sort_by(|a, b| b.total_duration_sec.cmp(&a.total_duration_sec));
+        apps.sort_by_key(|a| std::cmp::Reverse(a.total_duration_sec));
 
         for app in &mut apps {
-            app.titles.sort_by(|a, b| b.duration_sec.cmp(&a.duration_sec));
+            app.titles.sort_by_key(|a| std::cmp::Reverse(a.duration_sec));
         }
 
         Ok(apps)

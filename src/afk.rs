@@ -69,6 +69,7 @@ impl AfkWatcher {
             }
         });
 
+        #[allow(clippy::collapsible_if)]
         if let Ok(screensaver_alt) = ScreenSaverProxy::builder(&session_conn)
             .path("/ScreenSaver")?
             .build()
