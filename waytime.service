@@ -1,0 +1,15 @@
+[Unit]
+Description=Waytime Screen Time Tracker Daemon
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/waytime daemon
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target
