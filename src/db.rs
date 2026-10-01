@@ -1,7 +1,7 @@
 use dirs::data_local_dir;
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use std::fs::create_dir_all;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct AppSummary {
@@ -30,9 +30,15 @@ impl Database {
     pub fn open() -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let base_dir = data_local_dir().ok_or("Could not locate local data directory")?;
         let waytime_dir = base_dir.join("waytime");
-        create_dir_all(&waytime_dir)?;
-
         let db_path: PathBuf = waytime_dir.join("data.db");
+        Self::open_at(&db_path)
+    }
+
+    pub fn open_at(db_path: &Path) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        if let Some(parent) = db_path.parent() {
+            create_dir_all(parent)?;
+        }
+
         let conn = Connection::open(db_path)?;
 
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -151,7 +157,8 @@ impl Database {
         apps.sort_by_key(|a| std::cmp::Reverse(a.total_duration_sec));
 
         for app in &mut apps {
-            app.titles.sort_by_key(|a| std::cmp::Reverse(a.duration_sec));
+            app.titles
+                .sort_by_key(|a| std::cmp::Reverse(a.duration_sec));
         }
 
         Ok(apps)

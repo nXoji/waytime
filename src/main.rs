@@ -1,5 +1,6 @@
 mod afk;
 mod cli;
+pub mod config;
 mod db;
 mod tracker;
 mod watcher;
@@ -8,6 +9,7 @@ use afk::{AfkEvent, AfkWatcher};
 use chrono::Local;
 use clap::Parser;
 use cli::Cli;
+use config::Config;
 use db::Database;
 use std::time::Duration;
 use tracker::Tracker;
@@ -18,8 +20,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
 
     if args.is_daemon() {
+        let config_path = Config::resolve_path(args.config.as_deref())?;
+        let config = Config::load(args.config.as_deref())?;
+        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+        println!("[{timestamp}] Config: {}", config_path.display());
+
         let db = Database::open()?;
-        let mut tracker = Tracker::new(db);
+        let mut tracker = Tracker::new(db, config);
         let mut watcher = WindowWatcher::new().await?;
         let mut afk_watcher = AfkWatcher::new().await?;
 

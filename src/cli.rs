@@ -34,6 +34,10 @@ pub struct Cli {
     /// Show detailed window title breakdown
     #[arg(short = 'd', long, global = true)]
     pub details: bool,
+
+    /// Custom path to configuration file
+    #[arg(short = 'c', long, global = true, value_name = "PATH")]
+    pub config: Option<std::path::PathBuf>,
 }
 
 impl Cli {
