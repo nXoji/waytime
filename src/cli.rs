@@ -14,7 +14,7 @@ pub enum ReportPeriod {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "waytime", about = "Minimal screen time tracker for Wayland")]
+#[command(name = "waytime", version, about = "Minimal screen time tracker for Wayland")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
