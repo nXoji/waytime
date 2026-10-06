@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release Linux x86_64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        env:
+          RUSTFLAGS: "--remap-path-prefix=${{ github.workspace }}=/build"
+        run: cargo build --release --locked
+
+      - name: Package release archive
+        run: |
+          TAG_NAME="${{ github.ref_name }}"
+          ARCHIVE_DIR="waytime-${TAG_NAME}-linux-x86_64"
+          mkdir -p "$ARCHIVE_DIR"
+
+          cp target/release/waytime "$ARCHIVE_DIR/"
+          cp waytime.service "$ARCHIVE_DIR/"
+          cp LICENSE "$ARCHIVE_DIR/"
+          cp README.md "$ARCHIVE_DIR/"
+
+          tar -czvf "${ARCHIVE_DIR}.tar.gz" "$ARCHIVE_DIR"
+
+      - name: Upload binaries to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: waytime-*-linux-x86_64.tar.gz
+          draft: true
+          generate_release_notes: true

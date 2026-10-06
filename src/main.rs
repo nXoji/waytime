@@ -1,5 +1,6 @@
 mod afk;
 mod cli;
+pub mod config;
 mod db;
 mod tracker;
 mod watcher;
@@ -8,8 +9,10 @@ use afk::{AfkEvent, AfkWatcher};
 use chrono::Local;
 use clap::Parser;
 use cli::Cli;
+use config::Config;
 use db::Database;
 use std::time::Duration;
+use tokio::signal::unix::{signal, SignalKind};
 use tracker::Tracker;
 use watcher::WindowWatcher;
 
@@ -17,11 +20,23 @@ use watcher::WindowWatcher;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
 
+    if args.config_path {
+        let config_path = Config::resolve_path(args.config.as_deref())?;
+        println!("{}", config_path.display());
+        return Ok(());
+    }
+
     if args.is_daemon() {
+        let config_path = Config::resolve_path(args.config.as_deref())?;
+        let config = Config::load(args.config.as_deref())?;
+        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+        println!("[{timestamp}] Config: {}", config_path.display());
+
         let db = Database::open()?;
-        let mut tracker = Tracker::new(db);
+        let mut tracker = Tracker::new(db, config);
         let mut watcher = WindowWatcher::new().await?;
         let mut afk_watcher = AfkWatcher::new().await?;
+        let mut sigterm = signal(SignalKind::terminate())?;
 
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
         heartbeat_interval.tick().await;
@@ -29,6 +44,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
+                    tracker.flush();
+                    let _ = watcher.unload().await;
+                    break;
+                }
+                _ = sigterm.recv() => {
                     tracker.flush();
                     let _ = watcher.unload().await;
                     break;
@@ -58,7 +78,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         let db = Database::open()?;
-        cli::run_report(&db, args.period(), args.details)?;
+        if args.json {
+            let (start_ts, end_ts, _) = cli::get_range_for_period(args.period());
+            if args.details {
+                let summaries = db.get_detailed_summary_range(start_ts, end_ts)?;
+                println!("{}", serde_json::to_string_pretty(&summaries)?);
+            } else {
+                let summaries = db.get_summary_range(start_ts, end_ts)?;
+                println!("{}", serde_json::to_string_pretty(&summaries)?);
+            }
+        } else {
+            cli::run_report(&db, args.period(), args.details)?;
+        }
     }
 
     Ok(())
