@@ -102,6 +102,11 @@ impl Tracker {
 
         let now = Local::now().timestamp();
 
+        if event.app_id.trim().is_empty() {
+            self.close_active_session(now);
+            return;
+        }
+
         if self.config.is_ignored(&event.app_id) {
             self.close_active_session(now);
             return;
@@ -280,6 +285,36 @@ mod tests {
         assert!(tracker.is_idle());
 
         // Check that firefox was recorded in the database
+        let summaries = tracker.db.get_summary_range(now - 10, now + 30).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].app_id, "firefox");
+        assert!(summaries[0].duration_sec >= 10);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn test_tracker_empty_app_id_enters_idle() {
+        let (db, db_path) = setup_test_db();
+        let config = Config::default();
+        let mut tracker = Tracker::new(db, config);
+
+        let now = Local::now().timestamp();
+
+        tracker.handle_window_event(WindowEvent {
+            app_id: "firefox".to_string(),
+            title: "Mozilla Firefox".to_string(),
+        });
+        tracker.heartbeat(now + 10);
+        assert!(!tracker.is_idle());
+
+        // Empty / whitespace app_id closes active session and sets idle
+        tracker.handle_window_event(WindowEvent {
+            app_id: "   ".to_string(),
+            title: "".to_string(),
+        });
+        assert!(tracker.is_idle());
+
         let summaries = tracker.db.get_summary_range(now - 10, now + 30).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].app_id, "firefox");
