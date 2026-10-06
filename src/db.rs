@@ -3,19 +3,21 @@ use rusqlite::{Connection, Result, params};
 use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone)]
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AppSummary {
     pub app_id: String,
     pub duration_sec: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TitleSummary {
     pub title: String,
     pub duration_sec: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AppDetailedSummary {
     pub app_id: String,
     pub total_duration_sec: i64,

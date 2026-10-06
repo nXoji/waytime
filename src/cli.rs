@@ -38,6 +38,14 @@ pub struct Cli {
     /// Custom path to configuration file
     #[arg(short = 'c', long, global = true, value_name = "PATH")]
     pub config: Option<std::path::PathBuf>,
+
+    /// Print resolved configuration file path and exit
+    #[arg(long, global = true)]
+    pub config_path: bool,
+
+    /// Output report in JSON format
+    #[arg(long, global = true)]
+    pub json: bool,
 }
 
 impl Cli {
