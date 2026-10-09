@@ -12,7 +12,7 @@ use cli::Cli;
 use config::Config;
 use db::Database;
 use std::time::Duration;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tracker::Tracker;
 use watcher::WindowWatcher;
 
@@ -77,9 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     } else {
+        let (start_ts, end_ts, label) = args.resolve_filter()?;
         let db = Database::open()?;
         if args.json {
-            let (start_ts, end_ts, _) = cli::get_range_for_period(args.period());
             if args.details {
                 let summaries = db.get_detailed_summary_range(start_ts, end_ts)?;
                 println!("{}", serde_json::to_string_pretty(&summaries)?);
@@ -88,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&summaries)?);
             }
         } else {
-            cli::run_report(&db, args.period(), args.details)?;
+            cli::run_report(&db, start_ts, end_ts, &label, args.details)?;
         }
     }
 
