@@ -1,6 +1,6 @@
 use dirs::data_local_dir;
 use rusqlite::{Connection, Result, params};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
 
@@ -32,10 +32,17 @@ pub struct AppliedMigration {
     pub applied_at: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AppSummary {
     pub app_id: String,
     pub duration_sec: i64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CategorySummary {
+    pub category: String,
+    pub total_duration_sec: i64,
+    pub apps: Vec<AppSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -287,6 +294,77 @@ impl Database {
     pub fn get_summary_since(&self, since_ts: i64) -> Result<Vec<AppSummary>, rusqlite::Error> {
         self.get_summary_range(since_ts, chrono::Local::now().timestamp())
     }
+
+    #[allow(dead_code)]
+    pub fn get_app_duration_range(
+        &self,
+        app_id: &str,
+        start_ts: i64,
+        end_ts: i64,
+    ) -> Result<i64, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(SUM(MAX(0, MIN(ended_at, ?2) - MAX(started_at, ?1))), 0)
+             FROM activity_intervals
+             WHERE ended_at >= ?1 AND started_at <= ?2 AND app_id = ?3 COLLATE NOCASE",
+        )?;
+
+        let duration: i64 = stmt.query_row(params![start_ts, end_ts, app_id], |row| {
+            Ok(row.get::<_, Option<i64>>(0)?.unwrap_or(0))
+        })?;
+
+        Ok(duration)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_category_summary_range(
+        &self,
+        start_ts: i64,
+        end_ts: i64,
+        categories: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<Vec<CategorySummary>, rusqlite::Error> {
+        let app_summaries = self.get_summary_range(start_ts, end_ts)?;
+
+        let mut category_map: HashMap<String, (i64, Vec<AppSummary>)> = HashMap::new();
+
+        let mut sorted_categories: Vec<(&String, &Vec<String>)> = categories.iter().collect();
+        sorted_categories.sort_by_key(|(k, _)| *k);
+
+        for app in app_summaries {
+            let mut matched_category = None;
+            for (cat_name, app_list) in &sorted_categories {
+                if app_list.iter().any(|configured_app| {
+                    configured_app.eq_ignore_ascii_case(&app.app_id)
+                        || configured_app.to_lowercase() == app.app_id.to_lowercase()
+                }) {
+                    matched_category = Some((*cat_name).clone());
+                    break;
+                }
+            }
+
+            let category = matched_category.unwrap_or_else(|| "Uncategorized".to_string());
+            let entry = category_map
+                .entry(category)
+                .or_insert_with(|| (0, Vec::new()));
+            entry.0 += app.duration_sec;
+            entry.1.push(app);
+        }
+
+        let mut summaries: Vec<CategorySummary> = category_map
+            .into_iter()
+            .map(|(category, (total_duration_sec, mut apps))| {
+                apps.sort_by_key(|a| (std::cmp::Reverse(a.duration_sec), a.app_id.clone()));
+                CategorySummary {
+                    category,
+                    total_duration_sec,
+                    apps,
+                }
+            })
+            .collect();
+
+        summaries.sort_by_key(|c| (std::cmp::Reverse(c.total_duration_sec), c.category.clone()));
+
+        Ok(summaries)
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +521,172 @@ mod tests {
         let applied = Database::get_applied_versions(&conn).expect("get_applied failed");
         assert!(applied.contains(&1));
         assert!(!applied.contains(&2));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn test_get_app_duration_range() {
+        let db_path = temp_db_path("test_app_duration");
+        let db = Database::open_at(&db_path).expect("failed to open database");
+
+        // Insert intervals
+        // firefox: 100..200 (100s)
+        db.insert_interval("firefox", "Mozilla Firefox", 100, 200)
+            .expect("insert failed");
+        // Firefox (different case): 250..350 (100s)
+        db.insert_interval("Firefox", "Firefox Settings", 250, 350)
+            .expect("insert failed");
+        // code: 100..300 (200s)
+        db.insert_interval("code", "VS Code", 100, 300)
+            .expect("insert failed");
+
+        // Exact match
+        assert_eq!(db.get_app_duration_range("code", 0, 500).unwrap(), 200);
+
+        // Case-insensitive matches for firefox (aggregating both "firefox" and "Firefox")
+        assert_eq!(db.get_app_duration_range("firefox", 0, 500).unwrap(), 200);
+        assert_eq!(db.get_app_duration_range("FIREFOX", 0, 500).unwrap(), 200);
+        assert_eq!(db.get_app_duration_range("Firefox", 0, 500).unwrap(), 200);
+        assert_eq!(db.get_app_duration_range("fIrEfOx", 0, 500).unwrap(), 200);
+
+        // Case-insensitive match for code
+        assert_eq!(db.get_app_duration_range("CODE", 0, 500).unwrap(), 200);
+
+        // Partial intersection range:
+        // For code (100..300), range is 150..250 => intersection is 100s
+        assert_eq!(db.get_app_duration_range("code", 150, 250).unwrap(), 100);
+
+        // For firefox (100..200 and 250..350), range is 150..300
+        // (200 - 150) + (300 - 250) = 50 + 50 = 100s
+        assert_eq!(db.get_app_duration_range("firefox", 150, 300).unwrap(), 100);
+
+        // Disjoint range => 0
+        assert_eq!(db.get_app_duration_range("code", 400, 500).unwrap(), 0);
+
+        // Non-existent app => 0
+        assert_eq!(db.get_app_duration_range("nonexistent", 0, 500).unwrap(), 0);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn test_get_category_summary_range() {
+        let db_path = temp_db_path("test_category_summary");
+        let db = Database::open_at(&db_path).expect("failed to open database");
+
+        // Insert intervals
+        // Development apps:
+        // "code": 1000..1500 (500s)
+        db.insert_interval("code", "main.rs", 1000, 1500)
+            .expect("insert failed");
+        // "nvim": 1000..1200 (200s)
+        db.insert_interval("nvim", "config.rs", 1000, 1200)
+            .expect("insert failed");
+        // Development total = 700s
+
+        // Social apps:
+        // "discord" (case-insensitive in category config): 1000..1400 (400s)
+        db.insert_interval("discord", "Chat", 1000, 1400)
+            .expect("insert failed");
+        // Social total = 400s
+
+        // Uncategorized apps:
+        // "gimp": 1000..1300 (300s)
+        db.insert_interval("gimp", "image.png", 1000, 1300)
+            .expect("insert failed");
+        // "vlc": 1000..1150 (150s)
+        db.insert_interval("vlc", "video.mp4", 1000, 1150)
+            .expect("insert failed");
+        // Uncategorized total = 450s
+
+        let mut categories = std::collections::HashMap::new();
+        categories.insert(
+            "Development".to_string(),
+            vec!["code".to_string(), "nvim".to_string()],
+        );
+        categories.insert(
+            "Social".to_string(),
+            vec!["DISCORD".to_string()], // Test case-insensitive matching
+        );
+
+        let summaries = db
+            .get_category_summary_range(900, 1600, &categories)
+            .expect("query failed");
+
+        assert_eq!(summaries.len(), 3);
+
+        // Categories sorted by total_duration_sec descending:
+        // 1. Development: 700s
+        // 2. Uncategorized: 450s
+        // 3. Social: 400s
+        assert_eq!(summaries[0].category, "Development");
+        assert_eq!(summaries[0].total_duration_sec, 700);
+        assert_eq!(summaries[0].apps.len(), 2);
+        // Apps within Development sorted by duration descending:
+        assert_eq!(
+            summaries[0].apps[0],
+            AppSummary {
+                app_id: "code".to_string(),
+                duration_sec: 500,
+            }
+        );
+        assert_eq!(
+            summaries[0].apps[1],
+            AppSummary {
+                app_id: "nvim".to_string(),
+                duration_sec: 200,
+            }
+        );
+
+        assert_eq!(summaries[1].category, "Uncategorized");
+        assert_eq!(summaries[1].total_duration_sec, 450);
+        assert_eq!(summaries[1].apps.len(), 2);
+        // Apps within Uncategorized sorted by duration descending:
+        assert_eq!(
+            summaries[1].apps[0],
+            AppSummary {
+                app_id: "gimp".to_string(),
+                duration_sec: 300,
+            }
+        );
+        assert_eq!(
+            summaries[1].apps[1],
+            AppSummary {
+                app_id: "vlc".to_string(),
+                duration_sec: 150,
+            }
+        );
+
+        assert_eq!(summaries[2].category, "Social");
+        assert_eq!(summaries[2].total_duration_sec, 400);
+        assert_eq!(summaries[2].apps.len(), 1);
+        assert_eq!(
+            summaries[2].apps[0],
+            AppSummary {
+                app_id: "discord".to_string(),
+                duration_sec: 400,
+            }
+        );
+
+        // When all apps are categorized, "Uncategorized" does not appear
+        categories.insert("Graphics".to_string(), vec!["gimp".to_string()]);
+        categories.insert("Media".to_string(), vec!["vlc".to_string()]);
+        let all_categorized = db
+            .get_category_summary_range(900, 1600, &categories)
+            .expect("query failed");
+        assert_eq!(all_categorized.len(), 4);
+        assert!(
+            !all_categorized
+                .iter()
+                .any(|c| c.category == "Uncategorized")
+        );
+
+        // Empty range returns empty vec
+        let empty = db
+            .get_category_summary_range(5000, 6000, &categories)
+            .expect("query failed");
+        assert!(empty.is_empty());
 
         let _ = fs::remove_file(db_path);
     }
