@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::db::Database;
 use crate::watcher::WindowEvent;
-use chrono::Local;
+use chrono::{Local, NaiveDate, TimeZone};
+use std::collections::HashSet;
 
 #[derive(Debug)]
 struct ActiveSession {
@@ -17,6 +18,8 @@ pub struct Tracker {
     config: Config,
     active_session: Option<ActiveSession>,
     is_paused: bool,
+    pub notified_limits: HashSet<String>,
+    pub last_alert_day: Option<NaiveDate>,
 }
 
 impl Tracker {
@@ -26,6 +29,8 @@ impl Tracker {
             config,
             active_session: None,
             is_paused: false,
+            notified_limits: HashSet::new(),
+            last_alert_day: None,
         }
     }
 
@@ -116,6 +121,7 @@ impl Tracker {
         if let Some(session) = &mut self.active_session {
             if session.app_id == event.app_id && session.title == event.title {
                 session.ended_at = now;
+                self.check_limits(now);
                 return;
             }
         }
@@ -129,6 +135,8 @@ impl Tracker {
             started_at: now,
             ended_at: now,
         });
+
+        self.check_limits(now);
     }
 
     pub fn heartbeat(&mut self, now: i64) {
@@ -148,6 +156,105 @@ impl Tracker {
                     session.ended_at,
                 ) {
                     session.db_id = Some(id);
+                }
+            }
+        }
+
+        self.check_limits(now);
+    }
+
+    pub fn check_limits(&mut self, now_ts: i64) {
+        let today = chrono::DateTime::from_timestamp(now_ts, 0)
+            .map(|dt| dt.with_timezone(&Local).date_naive())
+            .unwrap_or_else(|| Local::now().date_naive());
+
+        if Some(today) != self.last_alert_day {
+            self.notified_limits.clear();
+            self.last_alert_day = Some(today);
+        }
+
+        if self.is_paused {
+            return;
+        }
+
+        let session = match &self.active_session {
+            Some(s) if !s.app_id.trim().is_empty() && !self.config.is_ignored(&s.app_id) => s,
+            _ => return,
+        };
+
+        let app_id = session.app_id.clone();
+
+        let midnight_ts = today
+            .and_hms_opt(0, 0, 0)
+            .and_then(|naive_dt| Local.from_local_datetime(&naive_dt).earliest())
+            .map(|dt| dt.timestamp())
+            .unwrap_or(0);
+
+        let db_duration = self
+            .db
+            .get_app_duration_range(&app_id, midnight_ts, now_ts)
+            .unwrap_or(0);
+
+        let current_interval = if session.db_id.is_some() {
+            (now_ts - session.ended_at).max(0)
+        } else {
+            (now_ts - session.started_at).max(0)
+        };
+
+        let app_duration = db_duration + current_interval;
+
+        // 1. App-level limit check
+        if let Some(app_limit) = self.config.get_limit_seconds(&app_id)
+            && app_duration >= app_limit as i64
+            && !self.notified_limits.contains(&app_id)
+        {
+            self.notified_limits.insert(app_id.clone());
+            let target = app_id.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let summary = format!("Time limit reached: {target}");
+                    let body =
+                        format!("You have reached your daily screen time limit for {target}.");
+                    let _ = crate::notify::send_notification(&summary, &body).await;
+                });
+            }
+        }
+
+        // 2. Category-level limit check
+        if let Some(cat) = self.config.get_category(&app_id) {
+            let cat_name = cat.to_string();
+            if let Some(cat_limit) = self.config.get_limit_seconds(&cat_name) {
+                let cat_duration = match self.db.get_category_summary_range(
+                    midnight_ts,
+                    now_ts,
+                    &self.config.categories,
+                ) {
+                    Ok(summaries) => {
+                        let db_dur = summaries
+                            .iter()
+                            .find(|c| {
+                                c.category.eq_ignore_ascii_case(&cat_name)
+                                    || c.category.to_lowercase() == cat_name.to_lowercase()
+                            })
+                            .map(|c| c.total_duration_sec)
+                            .unwrap_or(0);
+                        db_dur + current_interval
+                    }
+                    Err(_) => app_duration,
+                };
+
+                if cat_duration >= cat_limit as i64 && !self.notified_limits.contains(&cat_name) {
+                    self.notified_limits.insert(cat_name.clone());
+                    let target = cat_name;
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            let summary = format!("Time limit reached: {target}");
+                            let body = format!(
+                                "You have reached your daily screen time limit for category {target}."
+                            );
+                            let _ = crate::notify::send_notification(&summary, &body).await;
+                        });
+                    }
                 }
             }
         }
@@ -319,6 +426,109 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].app_id, "firefox");
         assert!(summaries[0].duration_sec >= 10);
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn test_tracker_limit_tracking_and_notification() {
+        let (db, db_path) = setup_test_db();
+        let mut config = Config::default();
+        config.categories.insert(
+            "Development".to_string(),
+            vec!["code".to_string(), "nvim".to_string()],
+        );
+        config.limits.insert("code".to_string(), "100s".to_string());
+        config
+            .limits
+            .insert("Development".to_string(), "250s".to_string());
+
+        let mut tracker = Tracker::new(db, config);
+        let now = Local::now().timestamp();
+
+        tracker.handle_window_event(WindowEvent {
+            app_id: "code".to_string(),
+            title: "main.rs".to_string(),
+        });
+
+        // 50s: limit not reached yet (100s)
+        tracker.heartbeat(now + 50);
+        assert!(!tracker.notified_limits.contains("code"));
+        assert!(!tracker.notified_limits.contains("Development"));
+
+        // 100s: code limit reached
+        tracker.heartbeat(now + 100);
+        assert!(tracker.notified_limits.contains("code"));
+        assert!(!tracker.notified_limits.contains("Development"));
+
+        // 250s: Development category limit reached
+        tracker.heartbeat(now + 250);
+        assert!(tracker.notified_limits.contains("code"));
+        assert!(tracker.notified_limits.contains("Development"));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn test_tracker_notification_deduplication() {
+        let (db, db_path) = setup_test_db();
+        let mut config = Config::default();
+        config.limits.insert("code".to_string(), "100s".to_string());
+
+        let mut tracker = Tracker::new(db, config);
+        let now = Local::now().timestamp();
+
+        tracker.handle_window_event(WindowEvent {
+            app_id: "code".to_string(),
+            title: "main.rs".to_string(),
+        });
+
+        // Reach limit
+        tracker.heartbeat(now + 120);
+        assert_eq!(tracker.notified_limits.len(), 1);
+        assert!(tracker.notified_limits.contains("code"));
+
+        // Subsequent heartbeats on the same day must not duplicate
+        tracker.heartbeat(now + 150);
+        tracker.heartbeat(now + 200);
+        assert_eq!(tracker.notified_limits.len(), 1);
+        assert!(tracker.notified_limits.contains("code"));
+
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn test_tracker_day_transition_clears_alerts() {
+        let (db, db_path) = setup_test_db();
+        let mut config = Config::default();
+        config.limits.insert("code".to_string(), "60s".to_string());
+
+        let mut tracker = Tracker::new(db, config);
+        let now = Local::now().timestamp();
+
+        tracker.handle_window_event(WindowEvent {
+            app_id: "code".to_string(),
+            title: "main.rs".to_string(),
+        });
+
+        // Trigger limit on Day 1
+        tracker.heartbeat(now + 70);
+        assert!(tracker.notified_limits.contains("code"));
+        let day1 = tracker.last_alert_day;
+        assert!(day1.is_some());
+
+        // Close Day 1 session
+        tracker.flush();
+
+        // Simulate day transition by advancing timestamp by 24 hours (86400s)
+        let next_day_ts = now + 90000;
+        tracker.check_limits(next_day_ts);
+
+        // Day transition must clear notified_limits and update last_alert_day
+        assert!(tracker.notified_limits.is_empty());
+        let day2 = tracker.last_alert_day;
+        assert!(day2.is_some());
+        assert_ne!(day1, day2);
 
         let _ = fs::remove_file(db_path);
     }

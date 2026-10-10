@@ -2,6 +2,7 @@ mod afk;
 mod cli;
 pub mod config;
 mod db;
+mod notify;
 mod tracker;
 mod watcher;
 
