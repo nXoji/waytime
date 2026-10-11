@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, CellAlignment, Table};
 
+use crate::config::Config;
 use crate::db::Database;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +55,10 @@ pub struct Cli {
     /// Show detailed window title breakdown
     #[arg(short = 'd', long, global = true)]
     pub details: bool,
+
+    /// Group report output by categories
+    #[arg(short = 'C', long, global = true)]
+    pub categories: bool,
 
     /// Custom path to configuration file
     #[arg(short = 'c', long, global = true, value_name = "PATH")]
@@ -366,16 +371,127 @@ pub fn get_range_for_period(period: ReportPeriod) -> (i64, i64, &'static str) {
     }
 }
 
+pub fn format_compact_duration(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let days = seconds / 86400;
+    let rem = seconds % 86400;
+    let hours = rem / 3600;
+    let minutes = (rem % 3600) / 60;
+
+    if days > 0 {
+        format!("{days}d {hours:02}h {minutes:02}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+pub fn format_limit_progress(duration_sec: i64, limit_sec: u64) -> String {
+    let dur_str = format_compact_duration(duration_sec);
+    let limit_str = format_compact_duration(limit_sec as i64);
+
+    if limit_sec == 0 || duration_sec >= limit_sec as i64 {
+        format!("[{dur_str} / {limit_str} [EXCEEDED]]")
+    } else {
+        let pct = (duration_sec as f64 / limit_sec as f64) * 100.0;
+        format!("[{dur_str} / {limit_str} ({pct:.0}%)]")
+    }
+}
+
 pub fn run_report(
     db: &Database,
+    config: &Config,
     start_ts: i64,
     end_ts: i64,
     title_label: &str,
     details: bool,
+    by_categories: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Report: {title_label}");
 
-    if details {
+    if by_categories {
+        let cat_summaries = db.get_category_summary_range(start_ts, end_ts, &config.categories)?;
+        if cat_summaries.is_empty() {
+            println!("No activity recorded for {}.", title_label.to_lowercase());
+            return Ok(());
+        }
+
+        let total_sec: i64 = cat_summaries.iter().map(|c| c.total_duration_sec).sum();
+
+        let mut table = Table::new();
+        table.load_style(UTF8_FULL);
+        table.set_header(vec![
+            Cell::new("Category / Application"),
+            Cell::new("Time Spent").set_alignment(CellAlignment::Right),
+            Cell::new("Share (%)").set_alignment(CellAlignment::Right),
+        ]);
+        if let Some(col) = table.column_mut(1) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
+        if let Some(col) = table.column_mut(2) {
+            col.set_cell_alignment(CellAlignment::Right);
+        }
+
+        for cat in &cat_summaries {
+            let cat_share = if total_sec > 0 {
+                (cat.total_duration_sec as f64 / total_sec as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let cat_time_str = if let Some(limit) = config.get_limit_seconds(&cat.category) {
+                format!(
+                    "{} {}",
+                    format_duration(cat.total_duration_sec),
+                    format_limit_progress(cat.total_duration_sec, limit)
+                )
+            } else {
+                format_duration(cat.total_duration_sec)
+            };
+
+            table.add_row(vec![
+                Cell::new(&cat.category),
+                Cell::new(cat_time_str).set_alignment(CellAlignment::Right),
+                Cell::new(format!("{cat_share:.1}%")).set_alignment(CellAlignment::Right),
+            ]);
+
+            for (i, app) in cat.apps.iter().enumerate() {
+                let prefix = if i == cat.apps.len() - 1 {
+                    "└── "
+                } else {
+                    "├── "
+                };
+                let app_display = format!("{prefix}{}", app.app_id);
+
+                let app_time_str = if let Some(limit) = config.get_limit_seconds(&app.app_id) {
+                    format!(
+                        "{} {}",
+                        format_duration(app.duration_sec),
+                        format_limit_progress(app.duration_sec, limit)
+                    )
+                } else {
+                    format_duration(app.duration_sec)
+                };
+
+                let app_share = if cat.total_duration_sec > 0 {
+                    (app.duration_sec as f64 / cat.total_duration_sec as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                table.add_row(vec![
+                    Cell::new(app_display),
+                    Cell::new(app_time_str).set_alignment(CellAlignment::Right),
+                    Cell::new(format!("({app_share:.1}% of category)"))
+                        .set_alignment(CellAlignment::Right),
+                ]);
+            }
+        }
+
+        println!("{table}");
+        println!("Total Screen Time: {}", format_duration(total_sec));
+    } else if details {
         let summaries = db.get_detailed_summary_range(start_ts, end_ts)?;
         if summaries.is_empty() {
             println!("No activity recorded for {}.", title_label.to_lowercase());
@@ -405,10 +521,19 @@ pub fn run_report(
                 0.0
             };
 
+            let time_spent_str = if let Some(limit) = config.get_limit_seconds(&app.app_id) {
+                format!(
+                    "{} {}",
+                    format_duration(app.total_duration_sec),
+                    format_limit_progress(app.total_duration_sec, limit)
+                )
+            } else {
+                format_duration(app.total_duration_sec)
+            };
+
             table.add_row(vec![
                 Cell::new(&app.app_id),
-                Cell::new(format_duration(app.total_duration_sec))
-                    .set_alignment(CellAlignment::Right),
+                Cell::new(time_spent_str).set_alignment(CellAlignment::Right),
                 Cell::new(format!("{app_share:.1}%")).set_alignment(CellAlignment::Right),
             ]);
 
@@ -477,9 +602,19 @@ pub fn run_report(
                 0.0
             };
 
+            let time_spent_str = if let Some(limit) = config.get_limit_seconds(&app.app_id) {
+                format!(
+                    "{} {}",
+                    format_duration(app.duration_sec),
+                    format_limit_progress(app.duration_sec, limit)
+                )
+            } else {
+                format_duration(app.duration_sec)
+            };
+
             table.add_row(vec![
                 Cell::new(&app.app_id),
-                Cell::new(format_duration(app.duration_sec)).set_alignment(CellAlignment::Right),
+                Cell::new(time_spent_str).set_alignment(CellAlignment::Right),
                 Cell::new(format!("{share:.1}%")).set_alignment(CellAlignment::Right),
             ]);
         }
@@ -494,16 +629,18 @@ pub fn run_report(
 #[allow(dead_code)]
 pub fn run_report_for_period(
     db: &Database,
+    config: &Config,
     period: ReportPeriod,
     details: bool,
+    by_categories: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (start_ts, end_ts, label) = get_range_for_period(period);
-    run_report(db, start_ts, end_ts, label, details)
+    run_report(db, config, start_ts, end_ts, label, details, by_categories)
 }
 
 #[allow(dead_code)]
-pub fn run_today_report(db: &Database) -> Result<(), Box<dyn std::error::Error>> {
-    run_report_for_period(db, ReportPeriod::Today, false)
+pub fn run_today_report(db: &Database, config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    run_report_for_period(db, config, ReportPeriod::Today, false, false)
 }
 
 #[cfg(test)]
@@ -575,6 +712,7 @@ mod tests {
             to: None,
             since: None,
             details: false,
+            categories: false,
             config: None,
             config_path: false,
             json: false,
@@ -611,6 +749,7 @@ mod tests {
             to: Some("2026-05-01".to_string()),
             since: None,
             details: false,
+            categories: false,
             config: None,
             config_path: false,
             json: false,
@@ -663,5 +802,47 @@ mod tests {
         assert!(
             Cli::try_parse_from(["waytime", "--from", "2026-05-01", "--to", "2026-05-05"]).is_ok()
         );
+    }
+
+    #[test]
+    fn test_format_limit_progress() {
+        // Under limit
+        assert_eq!(format_limit_progress(2700, 3600), "[45m / 1h 00m (75%)]");
+        assert_eq!(format_limit_progress(1800, 7200), "[30m / 2h 00m (25%)]");
+
+        // Exact limit (100%)
+        assert_eq!(
+            format_limit_progress(3600, 3600),
+            "[1h 00m / 1h 00m [EXCEEDED]]"
+        );
+
+        // Exceeded limit (> 100%)
+        assert_eq!(
+            format_limit_progress(5400, 3600),
+            "[1h 30m / 1h 00m [EXCEEDED]]"
+        );
+        assert_eq!(
+            format_limit_progress(7200, 3600),
+            "[2h 00m / 1h 00m [EXCEEDED]]"
+        );
+    }
+
+    #[test]
+    fn test_cli_categories_flag() {
+        let cli_default = Cli::try_parse_from(["waytime"]).unwrap();
+        assert!(!cli_default.categories);
+
+        let cli_short = Cli::try_parse_from(["waytime", "-C"]).unwrap();
+        assert!(cli_short.categories);
+
+        let cli_long = Cli::try_parse_from(["waytime", "--categories"]).unwrap();
+        assert!(cli_long.categories);
+
+        let cli_with_period = Cli::try_parse_from(["waytime", "-w", "-C"]).unwrap();
+        assert!(cli_with_period.categories);
+        assert!(cli_with_period.week);
+
+        let cli_with_cmd = Cli::try_parse_from(["waytime", "today", "-C"]).unwrap();
+        assert!(cli_with_cmd.categories);
     }
 }

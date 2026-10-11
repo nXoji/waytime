@@ -80,8 +80,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         let (start_ts, end_ts, label) = args.resolve_filter()?;
         let db = Database::open()?;
+        let config = Config::load(args.config.as_deref())?;
         if args.json {
-            if args.details {
+            if args.categories {
+                let summaries =
+                    db.get_category_summary_range(start_ts, end_ts, &config.categories)?;
+                println!("{}", serde_json::to_string_pretty(&summaries)?);
+            } else if args.details {
                 let summaries = db.get_detailed_summary_range(start_ts, end_ts)?;
                 println!("{}", serde_json::to_string_pretty(&summaries)?);
             } else {
@@ -89,7 +94,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&summaries)?);
             }
         } else {
-            cli::run_report(&db, start_ts, end_ts, &label, args.details)?;
+            cli::run_report(
+                &db,
+                &config,
+                start_ts,
+                end_ts,
+                &label,
+                args.details,
+                args.categories,
+            )?;
         }
     }
 
