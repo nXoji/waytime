@@ -1,6 +1,6 @@
 [package]
 name = "waytime"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Lightweight screen time and application usage tracker for Wayland"
 license = "MIT"

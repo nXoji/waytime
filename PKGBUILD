@@ -1,6 +1,6 @@
 # Maintainer: nxoji
 pkgname=waytime
-pkgver=0.2.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Zero-overhead screen time tracker for Wayland & KDE Plasma"
 arch=('x86_64')
