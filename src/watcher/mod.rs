@@ -19,6 +19,74 @@ pub trait WindowWatcher: Send + Sync {
     ) -> tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum DesktopEnvironment {
+    Kde,
+    Other(String),
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum WatcherBackendKind {
+    Kwin,
+    Other(String),
+}
+
+#[allow(dead_code)]
+pub fn detect_desktop_environment() -> DesktopEnvironment {
+    let xdg = std::env::var("XDG_CURRENT_DESKTOP").ok();
+    let session = std::env::var("DESKTOP_SESSION").ok();
+    detect_desktop_environment_from_env(xdg.as_deref(), session.as_deref())
+}
+
+#[allow(dead_code)]
+pub fn detect_desktop_environment_from_env(
+    xdg_current_desktop: Option<&str>,
+    desktop_session: Option<&str>,
+) -> DesktopEnvironment {
+    let raw = xdg_current_desktop
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| desktop_session.filter(|s| !s.trim().is_empty()));
+
+    match raw {
+        Some(de) => {
+            let lower = de.to_ascii_lowercase();
+            if lower.contains("kde") || lower.contains("kwin") || lower.contains("plasma") {
+                DesktopEnvironment::Kde
+            } else {
+                DesktopEnvironment::Other(de.to_string())
+            }
+        }
+        None => DesktopEnvironment::Unknown,
+    }
+}
+
+pub fn detect_backend_from_env(
+    xdg_current_desktop: Option<&str>,
+    desktop_session: Option<&str>,
+) -> WatcherBackendKind {
+    match detect_desktop_environment_from_env(xdg_current_desktop, desktop_session) {
+        DesktopEnvironment::Kde => WatcherBackendKind::Kwin,
+        DesktopEnvironment::Other(de) => WatcherBackendKind::Other(de),
+        DesktopEnvironment::Unknown => WatcherBackendKind::Other("unknown".to_string()),
+    }
+}
+
+pub fn create_watcher() -> Result<Box<dyn WindowWatcher>, Box<dyn std::error::Error + Send + Sync>>
+{
+    let xdg = std::env::var("XDG_CURRENT_DESKTOP").ok();
+    let session = std::env::var("DESKTOP_SESSION").ok();
+    match detect_backend_from_env(xdg.as_deref(), session.as_deref()) {
+        WatcherBackendKind::Kwin => Ok(Box::new(KwinWatcher::new())),
+        WatcherBackendKind::Other(de) => Err(format!(
+            "Unsupported or not-yet-implemented desktop environment: {de}. Native Wayland backend is coming in next release."
+        )
+        .into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +191,90 @@ mod tests {
     fn test_kwin_watcher_reexport() {
         let watcher: Box<dyn WindowWatcher> = Box::new(KwinWatcher::new());
         drop(watcher);
+    }
+
+    #[test]
+    fn test_detect_backend_from_env_kde() {
+        assert_eq!(
+            detect_backend_from_env(Some("KDE"), None),
+            WatcherBackendKind::Kwin
+        );
+        assert_eq!(
+            detect_backend_from_env(Some("kde"), None),
+            WatcherBackendKind::Kwin
+        );
+        assert_eq!(
+            detect_backend_from_env(Some("plasma"), None),
+            WatcherBackendKind::Kwin
+        );
+        assert_eq!(
+            detect_backend_from_env(Some("KWin"), None),
+            WatcherBackendKind::Kwin
+        );
+        assert_eq!(
+            detect_backend_from_env(Some("KDE:Plasma"), None),
+            WatcherBackendKind::Kwin
+        );
+    }
+
+    #[test]
+    fn test_detect_backend_from_env_non_kde() {
+        assert_eq!(
+            detect_backend_from_env(Some("Hyprland"), None),
+            WatcherBackendKind::Other("Hyprland".to_string())
+        );
+        assert_eq!(
+            detect_backend_from_env(Some("sway"), None),
+            WatcherBackendKind::Other("sway".to_string())
+        );
+        assert_eq!(
+            detect_backend_from_env(Some("cosmic"), None),
+            WatcherBackendKind::Other("cosmic".to_string())
+        );
+        assert_eq!(
+            detect_backend_from_env(Some("river"), None),
+            WatcherBackendKind::Other("river".to_string())
+        );
+        assert_eq!(
+            detect_backend_from_env(Some("GNOME"), None),
+            WatcherBackendKind::Other("GNOME".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_backend_from_env_fallback() {
+        assert_eq!(
+            detect_backend_from_env(None, Some("plasma")),
+            WatcherBackendKind::Kwin
+        );
+        assert_eq!(
+            detect_backend_from_env(None, Some("sway")),
+            WatcherBackendKind::Other("sway".to_string())
+        );
+        assert_eq!(
+            detect_backend_from_env(Some(""), Some("plasma")),
+            WatcherBackendKind::Kwin
+        );
+        assert_eq!(
+            detect_backend_from_env(Some("   "), Some("KDE")),
+            WatcherBackendKind::Kwin
+        );
+        assert_eq!(
+            detect_backend_from_env(Some(""), Some("Hyprland")),
+            WatcherBackendKind::Other("Hyprland".to_string())
+        );
+        assert_eq!(
+            detect_backend_from_env(None, None),
+            WatcherBackendKind::Other("unknown".to_string())
+        );
+        assert_eq!(
+            detect_backend_from_env(Some(""), Some("")),
+            WatcherBackendKind::Other("unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_desktop_environment() {
+        let _ = detect_desktop_environment();
     }
 }

@@ -15,8 +15,6 @@ use db::Database;
 use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 use tracker::Tracker;
-use watcher::{KwinWatcher, WindowWatcher};
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
@@ -37,7 +35,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut tracker = Tracker::new(db, config);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-        let watcher: Box<dyn WindowWatcher> = Box::new(KwinWatcher::new());
+        let watcher = watcher::create_watcher().map_err(|e| {
+            eprintln!("[{timestamp}] {e}");
+            e as Box<dyn std::error::Error>
+        })?;
         let watcher_handle = watcher.start(event_tx, stop_rx);
         let mut afk_watcher = AfkWatcher::new().await?;
         let mut sigterm = signal(SignalKind::terminate())?;
