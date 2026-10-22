@@ -20,7 +20,6 @@ pub trait WindowWatcher: Send + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum DesktopEnvironment {
     Kde,
     Other(String),
@@ -28,20 +27,17 @@ pub enum DesktopEnvironment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum WatcherBackendKind {
     Kwin,
     Other(String),
 }
 
-#[allow(dead_code)]
 pub fn detect_desktop_environment() -> DesktopEnvironment {
     let xdg = std::env::var("XDG_CURRENT_DESKTOP").ok();
     let session = std::env::var("DESKTOP_SESSION").ok();
     detect_desktop_environment_from_env(xdg.as_deref(), session.as_deref())
 }
 
-#[allow(dead_code)]
 pub fn detect_desktop_environment_from_env(
     xdg_current_desktop: Option<&str>,
     desktop_session: Option<&str>,
@@ -74,11 +70,19 @@ pub fn detect_backend_from_env(
     }
 }
 
-pub fn create_watcher() -> Result<Box<dyn WindowWatcher>, Box<dyn std::error::Error + Send + Sync>>
-{
-    let xdg = std::env::var("XDG_CURRENT_DESKTOP").ok();
-    let session = std::env::var("DESKTOP_SESSION").ok();
-    match detect_backend_from_env(xdg.as_deref(), session.as_deref()) {
+pub fn create_watcher() -> Result<Box<dyn WindowWatcher>, Box<dyn std::error::Error + Send + Sync>> {
+    match detect_desktop_environment() {
+        DesktopEnvironment::Kde => create_watcher_with_env(Some("kde"), None),
+        DesktopEnvironment::Other(name) => create_watcher_with_env(Some(&name), None),
+        DesktopEnvironment::Unknown => create_watcher_with_env(None, None),
+    }
+}
+
+pub fn create_watcher_with_env(
+    xdg_current_desktop: Option<&str>,
+    desktop_session: Option<&str>,
+) -> Result<Box<dyn WindowWatcher>, Box<dyn std::error::Error + Send + Sync>> {
+    match detect_backend_from_env(xdg_current_desktop, desktop_session) {
         WatcherBackendKind::Kwin => Ok(Box::new(KwinWatcher::new())),
         WatcherBackendKind::Other(de) => Err(format!(
             "Unsupported or not-yet-implemented desktop environment: {de}. Native Wayland backend is coming in next release."
@@ -276,5 +280,89 @@ mod tests {
     #[test]
     fn test_detect_desktop_environment() {
         let _ = detect_desktop_environment();
+    }
+
+    #[test]
+    fn test_create_watcher_error_handling() {
+        let err = create_watcher_with_env(Some("sway"), None).err().expect("Expected error for sway");
+        let msg = err.to_string();
+        assert!(msg.contains("Unsupported or not-yet-implemented desktop environment: sway"));
+        assert!(msg.contains("Native Wayland backend is coming in next release."));
+
+        let err_hyprland = create_watcher_with_env(Some("Hyprland"), None).err().expect("Expected error for Hyprland");
+        assert!(err_hyprland.to_string().contains("Hyprland"));
+
+        let err_unknown = create_watcher_with_env(None, None).err().expect("Expected error for unknown");
+        assert!(err_unknown.to_string().contains("unknown"));
+
+        let ok_kwin = create_watcher_with_env(Some("KDE"), None);
+        assert!(ok_kwin.is_ok());
+    }
+
+    #[test]
+    fn test_desktop_environment_equality_and_debugging() {
+        let kde = DesktopEnvironment::Kde;
+        let other = DesktopEnvironment::Other("sway".to_string());
+        let unknown = DesktopEnvironment::Unknown;
+
+        assert_eq!(kde, DesktopEnvironment::Kde);
+        assert_eq!(other, DesktopEnvironment::Other("sway".to_string()));
+        assert_eq!(unknown, DesktopEnvironment::Unknown);
+        assert_ne!(kde, other);
+        assert_ne!(kde, unknown);
+        assert_ne!(other, unknown);
+        assert_ne!(other, DesktopEnvironment::Other("hyprland".to_string()));
+
+        assert_eq!(kde.clone(), kde);
+        assert_eq!(other.clone(), other);
+        assert_eq!(unknown.clone(), unknown);
+
+        assert_eq!(format!("{kde:?}"), "Kde");
+        assert!(format!("{other:?}").contains("sway"));
+        assert_eq!(format!("{unknown:?}"), "Unknown");
+
+        assert_eq!(
+            detect_desktop_environment_from_env(Some("   \t  \n  "), None),
+            DesktopEnvironment::Unknown
+        );
+        assert_eq!(
+            detect_desktop_environment_from_env(Some("   "), Some("   ")),
+            DesktopEnvironment::Unknown
+        );
+        assert_eq!(
+            detect_desktop_environment_from_env(Some("!@#$%^&*()"), None),
+            DesktopEnvironment::Other("!@#$%^&*()".to_string())
+        );
+        assert_eq!(
+            detect_desktop_environment_from_env(Some("  \t kDe \n "), None),
+            DesktopEnvironment::Kde
+        );
+    }
+
+    #[test]
+    fn test_watcher_backend_kind_debug_and_matching() {
+        let kwin = WatcherBackendKind::Kwin;
+        let other = WatcherBackendKind::Other("cosmic".to_string());
+
+        assert_eq!(kwin, WatcherBackendKind::Kwin);
+        assert_eq!(other, WatcherBackendKind::Other("cosmic".to_string()));
+        assert_ne!(kwin, other);
+        assert_eq!(kwin.clone(), kwin);
+        assert_eq!(other.clone(), other);
+
+        assert_eq!(format!("{kwin:?}"), "Kwin");
+        assert!(format!("{other:?}").contains("cosmic"));
+
+        let is_kwin = match kwin {
+            WatcherBackendKind::Kwin => true,
+            WatcherBackendKind::Other(_) => false,
+        };
+        assert!(is_kwin);
+
+        let other_name = match other {
+            WatcherBackendKind::Kwin => None,
+            WatcherBackendKind::Other(name) => Some(name),
+        };
+        assert_eq!(other_name.as_deref(), Some("cosmic"));
     }
 }
