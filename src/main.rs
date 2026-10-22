@@ -15,8 +15,6 @@ use db::Database;
 use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 use tracker::Tracker;
-use watcher::WindowWatcher;
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
@@ -35,26 +33,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let db = Database::open()?;
         let mut tracker = Tracker::new(db, config);
-        let mut watcher = WindowWatcher::new().await?;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let watcher = watcher::create_watcher().map_err(|e| {
+            eprintln!("[{timestamp}] {e}");
+            e as Box<dyn std::error::Error>
+        })?;
+        let watcher_handle = watcher.start(event_tx, stop_rx);
         let mut afk_watcher = AfkWatcher::new().await?;
         let mut sigterm = signal(SignalKind::terminate())?;
 
         let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30));
         heartbeat_interval.tick().await;
 
+        let mut stop_tx = Some(stop_tx);
+
         loop {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     tracker.flush();
-                    let _ = watcher.unload().await;
+                    if let Some(tx) = stop_tx.take() {
+                        let _ = tx.send(());
+                    }
                     break;
                 }
                 _ = sigterm.recv() => {
                     tracker.flush();
-                    let _ = watcher.unload().await;
+                    if let Some(tx) = stop_tx.take() {
+                        let _ = tx.send(());
+                    }
                     break;
                 }
-                Some(event) = watcher.next_event() => {
+                Some(event) = event_rx.recv() => {
                     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
                     println!("[{timestamp}] App: {} | Title: {}", event.app_id, event.title);
                     tracker.handle_window_event(event);
@@ -77,6 +87,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+
+        if let Some(tx) = stop_tx.take() {
+            let _ = tx.send(());
+        }
+        drop(event_rx);
+        let _ = watcher_handle.await;
     } else {
         let (start_ts, end_ts, label) = args.resolve_filter()?;
         let db = Database::open()?;

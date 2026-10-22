@@ -1,8 +1,12 @@
 use std::env::temp_dir;
 use std::fs;
 use std::path::PathBuf;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use zbus::{connection::Builder, interface, Connection};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
+use zbus::{Connection, connection::Builder, interface};
+
+use super::{WindowEvent, WindowWatcher};
 
 const SCRIPT_NAME: &str = "waytime_watcher";
 const SCRIPT_CONTENT: &str = r#"
@@ -46,72 +50,55 @@ if (workspace.windowActivated) {
 }
 "#;
 
-#[derive(Debug, Clone)]
-pub struct WindowEvent {
-    pub app_id: String,
-    pub title: String,
-}
-
 struct ActiveWindowReceiver {
-    tx: UnboundedSender<WindowEvent>,
+    tx: Arc<Mutex<Option<UnboundedSender<WindowEvent>>>>,
 }
 
 #[interface(name = "org.waytime.Watcher")]
 impl ActiveWindowReceiver {
     async fn window_changed(&self, app_id: String, title: String) {
-        let _ = self.tx.send(WindowEvent { app_id, title });
+        if let Some(tx) = self.tx.lock().ok().as_deref().and_then(Option::as_ref) {
+            let _ = tx.send(WindowEvent { app_id, title });
+        }
     }
 }
 
-pub struct WindowWatcher {
-    conn: Connection,
-    rx: UnboundedReceiver<WindowEvent>,
+#[derive(Debug, Default)]
+pub struct KwinWatcher {
     script_loaded: bool,
 }
 
-impl WindowWatcher {
-    pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let (tx, rx) = unbounded_channel();
-
-        let conn = Builder::session()?
-            .name("org.waytime.Watcher")?
-            .serve_at("/org/waytime/Watcher", ActiveWindowReceiver { tx })?
-            .build()
-            .await?;
-
-        let mut watcher = Self {
-            conn,
-            rx,
+impl KwinWatcher {
+    pub fn new() -> Self {
+        Self {
             script_loaded: false,
-        };
-
-        watcher.init_kwin_script().await?;
-        Ok(watcher)
+        }
     }
 
-    async fn init_kwin_script(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let is_loaded: bool = self
-            .conn
+    async fn init_kwin_script(
+        &mut self,
+        conn: &Connection,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let is_loaded: bool = conn
             .call_method(
                 Some("org.kde.KWin"),
                 "/Scripting",
                 Some("org.kde.kwin.Scripting"),
                 "isScriptLoaded",
-                &(SCRIPT_NAME),
+                &SCRIPT_NAME,
             )
             .await?
             .body()
             .deserialize()?;
 
         if is_loaded {
-            let _: bool = self
-                .conn
+            let _: bool = conn
                 .call_method(
                     Some("org.kde.KWin"),
                     "/Scripting",
                     Some("org.kde.kwin.Scripting"),
                     "unloadScript",
-                    &(SCRIPT_NAME),
+                    &SCRIPT_NAME,
                 )
                 .await?
                 .body()
@@ -125,8 +112,7 @@ impl WindowWatcher {
             .to_str()
             .ok_or("Temporary script path is invalid UTF-8")?;
 
-        let script_id: i32 = self
-            .conn
+        let script_id: i32 = conn
             .call_method(
                 Some("org.kde.KWin"),
                 "/Scripting",
@@ -138,7 +124,9 @@ impl WindowWatcher {
             .body()
             .deserialize()?;
 
-        self.conn
+        self.script_loaded = true;
+
+        let run_res = conn
             .call_method(
                 Some("org.kde.KWin"),
                 format!("/Scripting/Script{script_id}"),
@@ -146,28 +134,30 @@ impl WindowWatcher {
                 "run",
                 &(),
             )
-            .await?;
+            .await;
 
         let _ = fs::remove_file(script_path);
 
-        self.script_loaded = true;
+        if let Err(e) = run_res {
+            let _ = self.unload(conn).await;
+            return Err(e.into());
+        }
+
         Ok(())
     }
 
-    pub async fn next_event(&mut self) -> Option<WindowEvent> {
-        self.rx.recv().await
-    }
-
-    pub async fn unload(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn unload(
+        &mut self,
+        conn: &Connection,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.script_loaded {
-            let _: bool = self
-                .conn
+            let _: bool = conn
                 .call_method(
                     Some("org.kde.KWin"),
                     "/Scripting",
                     Some("org.kde.kwin.Scripting"),
                     "unloadScript",
-                    &(SCRIPT_NAME),
+                    &SCRIPT_NAME,
                 )
                 .await?
                 .body()
@@ -178,7 +168,48 @@ impl WindowWatcher {
     }
 }
 
-impl Drop for WindowWatcher {
+impl WindowWatcher for KwinWatcher {
+    fn start(
+        self: Box<Self>,
+        event_tx: UnboundedSender<WindowEvent>,
+        mut stop_rx: oneshot::Receiver<()>,
+    ) -> tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+        tokio::spawn(async move {
+            let mut watcher = *self;
+            let tx_slot = Arc::new(Mutex::new(Some(event_tx.clone())));
+            let conn = Builder::session()?
+                .name("org.waytime.Watcher")?
+                .serve_at(
+                    "/org/waytime/Watcher",
+                    ActiveWindowReceiver {
+                        tx: Arc::clone(&tx_slot),
+                    },
+                )?
+                .build()
+                .await?;
+
+            if let Err(e) = watcher.init_kwin_script(&conn).await {
+                let _ = watcher.unload(&conn).await;
+                return Err(e);
+            }
+
+            tokio::select! {
+                _ = event_tx.closed() => {}
+                _ = &mut stop_rx => {}
+            }
+
+            if let Ok(mut guard) = tx_slot.lock() {
+                guard.take();
+            }
+            drop(event_tx);
+
+            let _ = watcher.unload(&conn).await;
+            Ok(())
+        })
+    }
+}
+
+impl Drop for KwinWatcher {
     fn drop(&mut self) {
         if self.script_loaded {
             let _ = std::process::Command::new("qdbus6")
@@ -190,5 +221,16 @@ impl Drop for WindowWatcher {
                 ])
                 .output();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kwin_watcher_trait_object_instantiation() {
+        let watcher: Box<dyn WindowWatcher> = Box::new(KwinWatcher::new());
+        drop(watcher);
     }
 }
