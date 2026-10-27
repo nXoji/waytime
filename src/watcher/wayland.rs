@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::os::fd::AsFd;
+use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
+use tokio::time::sleep;
 use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::{
@@ -234,6 +236,124 @@ impl WaylandWatcher {
     }
 }
 
+enum SessionResult {
+    Stopped,
+    Disconnected,
+}
+
+async fn run_session(
+    event_tx: &UnboundedSender<WindowEvent>,
+    stop_rx: &mut oneshot::Receiver<()>,
+) -> SessionResult {
+    if event_tx.is_closed() {
+        return SessionResult::Stopped;
+    }
+
+    tokio::select! {
+        biased;
+        _ = &mut *stop_rx => return SessionResult::Stopped,
+        _ = event_tx.closed() => return SessionResult::Stopped,
+        else => {}
+    }
+
+    let conn = match Connection::connect_to_env() {
+        Ok(c) => c,
+        Err(_) => return SessionResult::Disconnected,
+    };
+    let display = conn.display();
+    let mut event_queue = conn.new_event_queue();
+    let qh = event_queue.handle();
+
+    let mut state = WaylandState {
+        event_tx: event_tx.clone(),
+        last_active: None,
+        ext_global: None,
+        zwlr_global: None,
+        active_protocol: ActiveProtocol::None,
+        ext_windows: HashMap::new(),
+        zwlr_windows: HashMap::new(),
+    };
+
+    let registry = display.get_registry(&qh, ());
+    if event_queue.roundtrip(&mut state).is_err() {
+        return SessionResult::Disconnected;
+    }
+
+    if let Some((name, version)) = state.ext_global {
+        let proxy = registry.bind::<ExtForeignToplevelListV1, _, _>(name, version.min(1), &qh, ());
+        state.active_protocol = ActiveProtocol::Ext(proxy);
+    } else if let Some((name, version)) = state.zwlr_global {
+        let proxy =
+            registry.bind::<ZwlrForeignToplevelManagerV1, _, _>(name, version.min(3), &qh, ());
+        state.active_protocol = ActiveProtocol::Zwlr(proxy);
+    } else {
+        return SessionResult::Disconnected;
+    }
+
+    if event_queue.roundtrip(&mut state).is_err() {
+        return SessionResult::Disconnected;
+    }
+
+    let owned_fd = match conn.as_fd().try_clone_to_owned() {
+        Ok(fd) => fd,
+        Err(_) => return SessionResult::Disconnected,
+    };
+    let async_fd = match unsafe { AsyncFd::register(owned_fd) } {
+        Ok(fd) => fd,
+        Err(_) => return SessionResult::Disconnected,
+    };
+
+    loop {
+        if event_tx.is_closed() {
+            return SessionResult::Stopped;
+        }
+
+        if conn.flush().is_err() {
+            return SessionResult::Disconnected;
+        }
+        if event_queue.dispatch_pending(&mut state).is_err() {
+            return SessionResult::Disconnected;
+        }
+
+        let read_guard = match event_queue.prepare_read() {
+            Some(guard) => guard,
+            None => {
+                if event_queue.dispatch_pending(&mut state).is_err() {
+                    return SessionResult::Disconnected;
+                }
+                continue;
+            }
+        };
+
+        tokio::select! {
+            _ = &mut *stop_rx => {
+                drop(read_guard);
+                return SessionResult::Stopped;
+            }
+            _ = event_tx.closed() => {
+                drop(read_guard);
+                return SessionResult::Stopped;
+            }
+            res = async_fd.readable() => {
+                let mut guard = match res {
+                    Ok(g) => g,
+                    Err(_) => return SessionResult::Disconnected,
+                };
+                guard.clear_ready();
+                if let Err(e) = read_guard.read() {
+                    if matches!(e, wayland_client::backend::WaylandError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::WouldBlock) {
+                        continue;
+                    }
+                    return SessionResult::Disconnected;
+                }
+                if event_queue.dispatch_pending(&mut state).is_err() {
+                    return SessionResult::Disconnected;
+                }
+            }
+        }
+    }
+}
+
 impl WindowWatcher for WaylandWatcher {
     fn start(
         self: Box<Self>,
@@ -241,86 +361,25 @@ impl WindowWatcher for WaylandWatcher {
         mut stop_rx: oneshot::Receiver<()>,
     ) -> tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
         tokio::spawn(async move {
-            let conn = Connection::connect_to_env()?;
-            let display = conn.display();
-            let mut event_queue = conn.new_event_queue();
-            let qh = event_queue.handle();
-
-            let mut state = WaylandState {
-                event_tx,
-                last_active: None,
-                ext_global: None,
-                zwlr_global: None,
-                active_protocol: ActiveProtocol::None,
-                ext_windows: HashMap::new(),
-                zwlr_windows: HashMap::new(),
-            };
-
-            let registry = display.get_registry(&qh, ());
-            event_queue.roundtrip(&mut state)?;
-
-            if let Some((name, version)) = state.ext_global {
-                let proxy =
-                    registry.bind::<ExtForeignToplevelListV1, _, _>(name, version.min(1), &qh, ());
-                state.active_protocol = ActiveProtocol::Ext(proxy);
-            } else if let Some((name, version)) = state.zwlr_global {
-                let proxy = registry.bind::<ZwlrForeignToplevelManagerV1, _, _>(
-                    name,
-                    version.min(3),
-                    &qh,
-                    (),
-                );
-                state.active_protocol = ActiveProtocol::Zwlr(proxy);
-            } else {
-                return Err(
-                    "No supported foreign toplevel protocol found on Wayland display".into(),
-                );
-            }
-
-            event_queue.roundtrip(&mut state)?;
-
-            let owned_fd = conn.as_fd().try_clone_to_owned()?;
-            let async_fd = unsafe { AsyncFd::register(owned_fd)? };
-
             loop {
-                conn.flush()?;
-                event_queue.dispatch_pending(&mut state)?;
+                if event_tx.is_closed() {
+                    break;
+                }
 
-                let read_guard = match event_queue.prepare_read() {
-                    Some(guard) => guard,
-                    None => {
-                        event_queue.dispatch_pending(&mut state)?;
-                        continue;
-                    }
-                };
-
-                tokio::select! {
-                    _ = &mut stop_rx => {
-                        drop(read_guard);
-                        break;
-                    }
-                    _ = state.event_tx.closed() => {
-                        drop(read_guard);
-                        break;
-                    }
-                    res = async_fd.readable() => {
-                        let mut guard = res?;
-                        guard.clear_ready();
-                        if let Err(e) = read_guard.read() {
-                            if matches!(e, wayland_client::backend::WaylandError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::WouldBlock) {
-                                continue;
-                            }
-                            return Err(e.into());
+                match run_session(&event_tx, &mut stop_rx).await {
+                    SessionResult::Stopped => break,
+                    SessionResult::Disconnected => {
+                        eprintln!(
+                            "[waytime] Wayland connection lost or failed, attempting reconnect in 2s..."
+                        );
+                        tokio::select! {
+                            _ = &mut stop_rx => break,
+                            _ = event_tx.closed() => break,
+                            _ = sleep(Duration::from_secs(2)) => {}
                         }
-                        event_queue.dispatch_pending(&mut state)?;
                     }
                 }
             }
-
-            drop(async_fd);
-            drop(state);
-            drop(event_queue);
-            drop(conn);
 
             Ok(())
         })
@@ -345,11 +404,32 @@ mod tests {
     async fn test_wayland_watcher_start_no_display() {
         let watcher = Box::new(WaylandWatcher::new());
         let (tx, _rx) = unbounded_channel();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let handle = watcher.start(tx, stop_rx);
+        let _ = stop_tx.send(());
+        let res = handle.await.expect("join handle failed");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_wayland_watcher_stop_on_dropped_sender() {
+        let watcher = Box::new(WaylandWatcher::new());
+        let (tx, _rx) = unbounded_channel();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let handle = watcher.start(tx, stop_rx);
+        drop(stop_tx);
+        let res = handle.await.expect("join handle failed");
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_wayland_watcher_stop_on_closed_event_tx() {
+        let watcher = Box::new(WaylandWatcher::new());
+        let (tx, rx) = unbounded_channel();
         let (_stop_tx, stop_rx) = oneshot::channel();
+        drop(rx);
         let handle = watcher.start(tx, stop_rx);
         let res = handle.await.expect("join handle failed");
-        if std::env::var("WAYLAND_DISPLAY").is_err() {
-            assert!(res.is_err());
-        }
+        assert!(res.is_ok());
     }
 }
