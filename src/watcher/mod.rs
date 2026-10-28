@@ -1,6 +1,8 @@
 pub mod kwin;
+pub mod wayland;
 
 pub use kwin::KwinWatcher;
+pub use wayland::WaylandWatcher;
 
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -70,7 +72,8 @@ pub fn detect_backend_from_env(
     }
 }
 
-pub fn create_watcher() -> Result<Box<dyn WindowWatcher>, Box<dyn std::error::Error + Send + Sync>> {
+pub fn create_watcher() -> Result<Box<dyn WindowWatcher>, Box<dyn std::error::Error + Send + Sync>>
+{
     match detect_desktop_environment() {
         DesktopEnvironment::Kde => create_watcher_with_env(Some("kde"), None),
         DesktopEnvironment::Other(name) => create_watcher_with_env(Some(&name), None),
@@ -84,10 +87,7 @@ pub fn create_watcher_with_env(
 ) -> Result<Box<dyn WindowWatcher>, Box<dyn std::error::Error + Send + Sync>> {
     match detect_backend_from_env(xdg_current_desktop, desktop_session) {
         WatcherBackendKind::Kwin => Ok(Box::new(KwinWatcher::new())),
-        WatcherBackendKind::Other(de) => Err(format!(
-            "Unsupported or not-yet-implemented desktop environment: {de}. Native Wayland backend is coming in next release."
-        )
-        .into()),
+        WatcherBackendKind::Other(_) => Ok(Box::new(WaylandWatcher::new())),
     }
 }
 
@@ -198,6 +198,12 @@ mod tests {
     }
 
     #[test]
+    fn test_wayland_watcher_reexport() {
+        let watcher: Box<dyn WindowWatcher> = Box::new(WaylandWatcher::new());
+        drop(watcher);
+    }
+
+    #[test]
     fn test_detect_backend_from_env_kde() {
         assert_eq!(
             detect_backend_from_env(Some("KDE"), None),
@@ -284,16 +290,14 @@ mod tests {
 
     #[test]
     fn test_create_watcher_error_handling() {
-        let err = create_watcher_with_env(Some("sway"), None).err().expect("Expected error for sway");
-        let msg = err.to_string();
-        assert!(msg.contains("Unsupported or not-yet-implemented desktop environment: sway"));
-        assert!(msg.contains("Native Wayland backend is coming in next release."));
+        let ok_sway = create_watcher_with_env(Some("sway"), None);
+        assert!(ok_sway.is_ok());
 
-        let err_hyprland = create_watcher_with_env(Some("Hyprland"), None).err().expect("Expected error for Hyprland");
-        assert!(err_hyprland.to_string().contains("Hyprland"));
+        let ok_hyprland = create_watcher_with_env(Some("Hyprland"), None);
+        assert!(ok_hyprland.is_ok());
 
-        let err_unknown = create_watcher_with_env(None, None).err().expect("Expected error for unknown");
-        assert!(err_unknown.to_string().contains("unknown"));
+        let ok_unknown = create_watcher_with_env(None, None);
+        assert!(ok_unknown.is_ok());
 
         let ok_kwin = create_watcher_with_env(Some("KDE"), None);
         assert!(ok_kwin.is_ok());
